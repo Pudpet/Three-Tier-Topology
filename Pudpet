@@ -1,0 +1,151 @@
+#include "ns3/mobility-module.h"
+#include "ns3/nstime.h"
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/netanim-module.h"
+#include "ns3/flow-monitor.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/flow-monitor-module.h"
+
+#define TCP_SINK_PORT 9000
+#define UDP_SINK_PORT 9001
+
+// Experimental parameters
+#define MAX_BULK_BYTES 100000
+#define DDOS_RATE "1Mb/s"
+#define MAX_SIMULATION_TIME 1
+
+// Number of Bots for DDoS
+#define NUMBER_OF_BOTS 100
+#define NUMBER_OF_EXTRA_NODES 4
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("DDoSAttack");
+
+int main(int argc, char *argv[])
+{
+    CommandLine cmd;
+    cmd.Parse(argc, argv);
+
+    Time::SetResolution(Time::NS);
+    LogComponentEnable("UdpEchoClientApplication", LOG_LEVEL_INFO);
+    LogComponentEnable("UdpEchoServerApplication", LOG_LEVEL_INFO);
+
+    // Create the node containers for the three-tier topology
+    NodeContainer coreNodes, aggregationNodes, accessNodes, botNodes, extraNodes;
+
+    // Core tier nodes (2 nodes)
+    coreNodes.Create(2);
+
+    // Aggregation tier nodes (2 nodes)
+    aggregationNodes.Create(2);
+
+    // Access tier nodes (legitimate connections and users)
+    accessNodes.Create(4);
+
+    // Bot nodes for the DDoS attack
+    botNodes.Create(NUMBER_OF_BOTS);
+
+    // Extra user nodes
+    extraNodes.Create(NUMBER_OF_EXTRA_NODES);
+
+    // Define the Point-To-Point links for the three-tier topology
+    PointToPointHelper ppCore, ppAggregation, ppAccess;
+    ppCore.SetDeviceAttribute("DataRate", StringValue("10Gbps"));
+    ppCore.SetChannelAttribute("Delay", StringValue("2ms"));
+
+    ppAggregation.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+    ppAggregation.SetChannelAttribute("Delay", StringValue("5ms"));
+
+    ppAccess.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    ppAccess.SetChannelAttribute("Delay", StringValue("10ms"));
+
+    // Connections between Core and Aggregation nodes
+    NetDeviceContainer coreToAgg1, coreToAgg2;
+    coreToAgg1 = ppCore.Install(coreNodes.Get(0), aggregationNodes.Get(0));
+    coreToAgg2 = ppCore.Install(coreNodes.Get(1), aggregationNodes.Get(1));
+
+    // Connections between Aggregation and Access nodes
+    NetDeviceContainer aggToAcc1, aggToAcc2;
+    aggToAcc1 = ppAggregation.Install(aggregationNodes.Get(0), accessNodes.Get(0));  // Access node 1
+    aggToAcc2 = ppAggregation.Install(aggregationNodes.Get(1), accessNodes.Get(1));  // Access node 2
+
+    // DDoS bot nodes connect to access node 1
+    NetDeviceContainer botDeviceContainer[NUMBER_OF_BOTS];
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        botDeviceContainer[i] = ppAccess.Install(botNodes.Get(i), accessNodes.Get(1));  // Connect bots to access node 1
+    }
+
+    // Extra nodes connected to access node 2
+    NetDeviceContainer extraDeviceContainer[NUMBER_OF_EXTRA_NODES];
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        extraDeviceContainer[i] = ppAccess.Install(extraNodes.Get(i), accessNodes.Get(2));  // Connect extra nodes to access node 2
+    }
+
+    // Enable packet capture
+    ppCore.EnablePcapAll("core_traffic/core");
+    ppAggregation.EnablePcapAll("aggregation_traffic/aggregation");
+    ppAccess.EnablePcapAll("access_traffic/access");
+
+    // Install internet stack on all nodes
+    InternetStackHelper stack;
+    stack.Install(coreNodes);
+    stack.Install(aggregationNodes);
+    stack.Install(accessNodes);
+    stack.Install(botNodes);
+    stack.Install(extraNodes);
+
+    // Assign IP addresses
+    Ipv4AddressHelper ipv4;
+    ipv4.SetBase("10.1.1.0", "255.255.255.0");
+    Ipv4InterfaceContainer coreIfaces = ipv4.Assign(coreToAgg1);
+
+    ipv4.SetBase("10.1.2.0", "255.255.255.0");
+    Ipv4InterfaceContainer aggIfaces = ipv4.Assign(aggToAcc1);
+
+    ipv4.SetBase("10.1.3.0", "255.255.255.0");
+    ipv4.Assign(botDeviceContainer[0]);  // Assign IP to the first bot for simplicity
+
+    // Assign IPs for extra nodes
+    for (int i = 0; i < NUMBER_OF_EXTRA_NODES; ++i)
+    {
+        ipv4.SetBase("10.1.4.0", "255.255.255.0");
+        ipv4.Assign(extraDeviceContainer[i]);
+    }
+
+    // DDoS Application
+    OnOffHelper onoff("ns3::UdpSocketFactory", Address(InetSocketAddress(coreIfaces.GetAddress(1), UDP_SINK_PORT)));
+    onoff.SetConstantRate(DataRate(DDOS_RATE));
+    ApplicationContainer onOffApp[NUMBER_OF_BOTS];
+    for (int i = 0; i < NUMBER_OF_BOTS; ++i)
+    {
+        onOffApp[i] = onoff.Install(botNodes.Get(i));
+        onOffApp[i].Start(Seconds(0.0));
+        onOffApp[i].Stop(Seconds(MAX_SIMULATION_TIME));
+    }
+
+    // TCP Sink for receiving traffic
+    PacketSinkHelper tcpSink("ns3::TcpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), TCP_SINK_PORT));
+    ApplicationContainer tcpSinkApp = tcpSink.Install(accessNodes.Get(3));  // Access node 3 as the server
+    tcpSinkApp.Start(Seconds(0.0));
+    tcpSinkApp.Stop(Seconds(MAX_SIMULATION_TIME));
+
+    // Simulation setup
+    FlowMonitorHelper flowHelper;
+    Ptr<FlowMonitor> flowMonitor = flowHelper.InstallAll();
+
+    Simulator::Stop(Seconds(MAX_SIMULATION_TIME));
+    Simulator::Run();
+
+    flowMonitor->SerializeToXmlFile("flowmonitor_ddos.xml", true, true);
+    Simulator::Destroy();
+
+    return 0;
+}
